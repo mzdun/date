@@ -3488,6 +3488,11 @@ remote_download(const std::string& version, char* error_buffer)
     return result;
 }
 
+static tar_gz_helper tar_gz_unpack = &extract_gz_file;
+void set_tar_gz_helper(tar_gz_helper helper) {
+	tar_gz_unpack = helper ? helper : & extract_gz_file;
+}
+
 bool
 remote_install(const std::string& version)
 {
@@ -3502,7 +3507,7 @@ remote_install(const std::string& version)
             remove_folder_and_subfolders(install);
         if (make_directory(install))
         {
-            if (extract_gz_file(version, gz_file, install))
+            if (tar_gz_unpack(version, gz_file, install))
                 success = true;
 #  ifdef _WIN32
             auto mapping_file_source = get_download_mapping_file(version);

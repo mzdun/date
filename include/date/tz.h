@@ -1310,6 +1310,11 @@ DATE_API bool        remote_install(const std::string& version);
 
 #endif
 
+using tar_gz_helper = bool (*)(const std::string& version,
+	                           const std::string& gz_file,
+	                           const std::string& dest_folder);
+DATE_API void set_tar_gz_helper(tar_gz_helper helper);
+
 // zoned_time
 
 namespace detail
