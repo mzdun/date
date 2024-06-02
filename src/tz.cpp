@@ -114,6 +114,7 @@
 #endif
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <sys/stat.h>
@@ -144,6 +145,7 @@
 #    include <shellapi.h> // ShFileOperation etc.
 #  endif  // HAS_REMOTE_API
 #else   // !_WIN32
+#  include <sys/file.h>
 #  include <unistd.h>
 #  if !USE_OS_TZDB && !defined(INSTALL)
 #    include <wordexp.h>
@@ -3307,10 +3309,10 @@ run_program(const char* prog, const char*const args[])
 
 static
 bool
-extract_gz_file(const std::string&, const std::string& gz_file, const std::string&)
+extract_gz_file(const std::string&, const std::filesystem::path& gz_file, const std::filesystem::path&)
 {
 #    if USE_SHELL_API
-    bool unzipped = std::system(("tar -xzf " + gz_file + " -C " + get_install()).c_str()) == EXIT_SUCCESS;
+    bool unzipped = std::system(("tar -xzf " + gz_file.string() + " -C " + get_install().string()).c_str()) == EXIT_SUCCESS;
 #    else  // !USE_SHELL_API
     const char prog[] = {"/usr/bin/tar"};
     const char*const args[] =
@@ -3365,8 +3367,92 @@ remote_download(const std::string& version, char* error_buffer)
 
 static tar_gz_helper tar_gz_unpack = &extract_gz_file;
 void set_tar_gz_helper(tar_gz_helper helper) {
-	tar_gz_unpack = helper ? helper : & extract_gz_file;
+    tar_gz_unpack = helper ? helper : & extract_gz_file;
 }
+
+class exclusive_lock_file {
+public:
+    // Throws if unable to acquire the lock
+    exclusive_lock_file(const std::filesystem::path& filename);
+
+    virtual ~exclusive_lock_file();
+
+    bool try_lock();
+
+    bool succeeded() const noexcept { return locked; }
+
+    void lock() {
+        unsigned loops{};
+        while (!try_lock()) {
+            ++loops;
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+    }
+
+private:
+    exclusive_lock_file(const exclusive_lock_file&) =
+        delete;  // not construction-copyable
+    exclusive_lock_file& operator=(const exclusive_lock_file&) =
+        delete;  // not assignment-copyable
+
+    bool locked {false};
+    std::filesystem::path filename;
+#ifdef _WIN32
+    HANDLE handle{INVALID_HANDLE_VALUE};
+#else
+    int fd{-1};
+#endif
+};
+
+exclusive_lock_file::exclusive_lock_file(const std::filesystem::path& filename)
+    : filename(filename)
+{
+    try_lock();
+}
+
+exclusive_lock_file::~exclusive_lock_file() {
+#ifdef _WIN32
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        delete_file(filename);
+    }
+#else
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        delete_file(filename);
+    }
+#endif
+}
+
+bool exclusive_lock_file::try_lock() {
+    if (locked) return true;
+
+#ifdef _WIN32
+    handle = CreateFileW(filename.c_str(), GENERIC_WRITE, 0, NULL,
+                         CREATE_ALWAYS, 0, NULL);
+    locked = (handle != INVALID_HANDLE_VALUE);
+#else   // _WIN32
+    fd = open(filename.c_str(), O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        throw std::runtime_error("Cannot open file " + filename.string() + ".");
+    }
+    locked = flock(fd, LOCK_EX | LOCK_NB) == 0;
+    if (!locked) {
+        close(fd);
+        fd = -1;
+    }
+#endif  // _WIN32
+    return locked;
+}
+
+static std::filesystem::path get_install_lock_file() {
+    auto path = get_install();
+    path.replace_filename(path.filename().string() + ".lock");
+    return path;
+}
+
+static std::string get_version(const std::filesystem::path& path);
 
 bool
 remote_install(const std::string& version)
@@ -3378,7 +3464,16 @@ remote_install(const std::string& version)
     auto gz_file = get_download_gz_file(version);
     if (file_exists(gz_file))
     {
+        exclusive_lock_file install_lock{get_install_lock_file()};
+        install_lock.lock();
+
         if (file_exists(install)) {
+            try {
+                if (get_version(install) == version)
+                return true;
+            } catch(std::runtime_error const&) {
+                // pass
+            }
             remove_folder_and_subfolders(install);
         }
 
