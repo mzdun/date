@@ -117,6 +117,7 @@ static_assert(HAS_REMOTE_API == 0 ? AUTO_DOWNLOAD == 0 : true,
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <filesystem>
 
 #ifdef _WIN32
 #  ifdef DATE_BUILD_DLL
@@ -1297,7 +1298,7 @@ DATE_API tzdb_list& get_tzdb_list();
 #if !USE_OS_TZDB
 
 DATE_API const tzdb& reload_tzdb();
-DATE_API void        set_install(const std::string& install);
+DATE_API void        set_install(const std::filesystem::path& install);
 
 #endif  // !USE_OS_TZDB
 
@@ -1311,8 +1312,8 @@ DATE_API bool        remote_install(const std::string& version);
 #endif
 
 using tar_gz_helper = bool (*)(const std::string& version,
-	                           const std::string& gz_file,
-	                           const std::string& dest_folder);
+	                           const std::filesystem::path& gz_file,
+	                           const std::filesystem::path& dest_folder);
 DATE_API void set_tar_gz_helper(tar_gz_helper helper);
 
 // zoned_time

@@ -172,12 +172,6 @@
 #endif
 #endif
 
-#ifdef _WIN32
-static CONSTDATA char folder_delimiter = '\\';
-#else   // !_WIN32
-static CONSTDATA char folder_delimiter = '/';
-#endif  // !_WIN32
-
 #if defined(__GNUC__) && __GNUC__ < 5
    // GCC 4.9 Bug 61489 Wrong warning with -Wmissing-field-initializers
 #  pragma GCC diagnostic push
@@ -202,64 +196,27 @@ namespace
     using co_task_mem_ptr = std::unique_ptr<wchar_t[], task_mem_deleter>;
 }
 
-static
-std::wstring
-convert_utf8_to_utf16(const std::string& s)
-{
-    std::wstring out;
-    const int size = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
-
-    if (size == 0)
-    {
-        std::string msg = "Failed to determine required size when converting \"";
-        msg += s;
-        msg += "\" to UTF-16.";
-        throw std::runtime_error(msg);
-    }
-
-    out.resize(size);
-    const int check = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &out[0], size);
-
-    if (size != check)
-    {
-        std::string msg = "Failed to convert \"";
-        msg += s;
-        msg += "\" to UTF-16.";
-        throw std::runtime_error(msg);
-    }
-
-    return out;
-}
-
 // We might need to know certain locations even if not using the remote API,
 // so keep these routines out of that block for now.
 static
-std::string
+std::filesystem::path
 get_known_folder(const GUID& folderid)
 {
-    std::string folder;
     PWSTR pfolder = nullptr;
     HRESULT hr = SHGetKnownFolderPath(folderid, KF_FLAG_DEFAULT, nullptr, &pfolder);
     if (SUCCEEDED(hr))
     {
         co_task_mem_ptr folder_ptr(pfolder);
-        const wchar_t* fptr = folder_ptr.get();
-        auto state = std::mbstate_t();
-        const auto required = std::wcsrtombs(nullptr, &fptr, 0, &state);
-        if (required != 0 && required != std::size_t(-1))
-        {
-            folder.resize(required);
-            std::wcsrtombs(&folder[0], &fptr, folder.size(), &state);
-        }
+        return pfolder;
     }
-    return folder;
+    return {};
 }
 
 #      ifndef INSTALL
 
 // Usually something like "c:\Users\username\Downloads".
 static
-std::string
+std::filesystem::path
 get_download_folder()
 {
     return get_known_folder(FOLDERID_Downloads);
@@ -273,7 +230,7 @@ get_download_folder()
 #    if !defined(INSTALL)
 
 static
-std::string
+std::filesystem::path
 expand_path(std::string path)
 {
 #      if TARGET_OS_IPHONE
@@ -290,7 +247,7 @@ expand_path(std::string path)
 }
 
 static
-std::string
+std::filesystem::path
 get_download_folder()
 {
     return expand_path("~/Downloads");
@@ -299,6 +256,16 @@ get_download_folder()
 #    endif // !defined(INSTALL)
 
 #  endif  // !_WIN32
+
+static inline std::string get_pref_path(std::filesystem::path& in_place) {
+    in_place.make_preferred();
+    return in_place.string();
+}
+
+static inline std::string get_pref_path(std::filesystem::path const& path) {
+    auto copy = path;
+    return get_pref_path(copy);
+}
 
 /*
  * This class is provided to mimic the following usage of `ifstream`:
@@ -342,7 +309,7 @@ public:
     file_streambuf(const file_streambuf&) = delete;
     file_streambuf& operator=(const file_streambuf&) = delete;
 
-    file_streambuf(const std::string& filename)
+    file_streambuf(const std::filesystem::path& filename)
         : file_(file_open(filename))
     {
     }
@@ -364,18 +331,17 @@ protected:
 
 private:
     FILE*
-    file_open(const std::string& filename)
+    file_open(const std::filesystem::path& filename)
     {
 #  ifdef _WIN32
-        std::wstring wfilename = convert_utf8_to_utf16(filename);
-        FILE* file = ::_wfopen(wfilename.c_str(), L"rb");
+        FILE* file = ::_wfopen(filename.c_str(), L"rb");
 #  else // !_WIN32
         FILE* file = ::fopen(filename.c_str(), "rb");
 #  endif // _WIN32
         if (file == NULL)
         {
             std::string msg = "Error opening file \"";
-            msg += filename;
+            msg += get_pref_path(filename);
             msg += "\".";
             throw std::runtime_error(msg);
         }
@@ -396,20 +362,20 @@ using namespace detail;
 #if !USE_OS_TZDB
 
 static
-std::string&
+std::filesystem::path&
 access_install()
 {
-    static std::string install
+    static std::filesystem::path install
 #ifndef INSTALL
 
-    = get_download_folder() + folder_delimiter + "tzdata";
+        = get_download_folder() / "tzdata";
 
 #else   // !INSTALL
 
 #  define STRINGIZEIMP(x) #x
 #  define STRINGIZE(x) STRINGIZEIMP(x)
 
-    = STRINGIZE(INSTALL) + std::string(1, folder_delimiter) + "tzdata";
+        = std::filesystem::path(STRINGIZE(INSTALL)) / "tzdata";
 
     #undef STRINGIZEIMP
     #undef STRINGIZE
@@ -419,26 +385,26 @@ access_install()
 }
 
 void
-set_install(const std::string& install)
+set_install(const std::filesystem::path& install)
 {
     access_install() = install;
 }
 
 static
-const std::string&
+const std::filesystem::path&
 get_install()
 {
-    static const std::string& ref = access_install();
-    return ref;
+    return access_install();
 }
 
 #if HAS_REMOTE_API
 static
-std::string
+std::filesystem::path
 get_download_gz_file(const std::string& version)
 {
-    auto file = get_install() + version + ".tar.gz";
-    return file;
+    auto path = get_install();
+    path.replace_filename(path.filename().string() + version + ".tar.gz");
+    return path;
 }
 #endif  // HAS_REMOTE_API
 
@@ -669,7 +635,7 @@ native_to_standard_timezone_name(const std::string& native_tz_name,
 // See timezone_mapping structure for more info.
 static
 std::vector<detail::timezone_mapping>
-load_timezone_mappings_from_xml_file(const std::string& input_path)
+load_timezone_mappings_from_xml_file(const std::filesystem::path& input_path)
 {
     std::size_t line_num = 0;
     std::vector<detail::timezone_mapping> mappings;
@@ -681,7 +647,7 @@ load_timezone_mappings_from_xml_file(const std::string& input_path)
     auto error = [&input_path, &line_num](const char* info)
     {
         std::string msg = "Error loading time zone mapping file \"";
-        msg += input_path;
+        msg += get_pref_path(input_path);
         msg += "\" at line ";
         msg += std::to_string(line_num);
         msg += ": ";
@@ -2943,11 +2909,10 @@ leap_second::leap_second(const std::string& s, detail::undocumented)
 
 static
 bool
-file_exists(const std::string& filename)
+file_exists(const std::filesystem::path& filename)
 {
 #ifdef _WIN32
-    std::wstring wfilename = convert_utf8_to_utf16(filename);
-    return ::_waccess(wfilename.c_str(), 0) == 0;
+    return ::_waccess(filename.c_str(), 0) == 0;
 #else
     return ::access(filename.c_str(), F_OK) == 0;
 #endif
@@ -3026,7 +2991,7 @@ namespace
 
 static
 bool
-download_to_file(const std::string& url, const std::string& local_filename,
+download_to_file(const std::string& url, const std::filesystem::path& local_filename,
                  download_file_options opts, char* error_buffer)
 {
     auto curl = curl_init();
@@ -3085,149 +3050,67 @@ remote_version()
 // TODO! Use <filesystem> eventually.
 static
 bool
-remove_folder_and_subfolders(const std::string& folder)
+remove_folder_and_subfolders(const std::filesystem::path& folder)
 {
-#  ifdef _WIN32
-#    if USE_SHELL_API
-    // Delete the folder contents by deleting the folder.
-    std::string cmd = "rd /s /q \"";
-    cmd += folder;
-    cmd += '\"';
-    return std::system(cmd.c_str()) == EXIT_SUCCESS;
-#    else  // !USE_SHELL_API
-    // Create a buffer containing the path to delete. It must be terminated
-    // by two nuls. Who designs these API's...
-    std::vector<char> from;
-    from.assign(folder.begin(), folder.end());
-    from.push_back('\0');
-    from.push_back('\0');
-    SHFILEOPSTRUCT fo{}; // Zero initialize.
-    fo.wFunc = FO_DELETE;
-    fo.pFrom = from.data();
-    fo.fFlags = FOF_NO_UI;
-    int ret = SHFileOperation(&fo);
-    if (ret == 0 && !fo.fAnyOperationsAborted)
-        return true;
-    return false;
-#    endif  // !USE_SHELL_API
-#  else   // !_WIN32
-#    if USE_SHELL_API
-    return std::system(("rm -R " + folder).c_str()) == EXIT_SUCCESS;
-#    else // !USE_SHELL_API
-    struct dir_deleter {
-        dir_deleter() {}
-        void operator()(DIR* d) const
-        {
-            if (d != nullptr)
-            {
-                int result = closedir(d);
-                assert(result == 0);
-            }
-        }
-    };
-    using closedir_ptr = std::unique_ptr<DIR, dir_deleter>;
-
-    std::string filename;
-    struct stat statbuf;
-    std::size_t folder_len = folder.length();
-    struct dirent* p = nullptr;
-
-    closedir_ptr d(opendir(folder.c_str()));
-    bool r = d.get() != nullptr;
-    while (r && (p=readdir(d.get())) != nullptr)
+    std::error_code ec{};
+    std::filesystem::remove_all(folder, ec);
+    if (ec)
     {
-        if (strcmp(p->d_name, ".") == 0 || strcmp(p->d_name, "..") == 0)
-           continue;
-
-        // + 2 for path delimiter and nul terminator.
-        std::size_t buf_len = folder_len + strlen(p->d_name) + 2;
-        filename.resize(buf_len);
-        std::size_t path_len = static_cast<std::size_t>(
-            snprintf(&filename[0], buf_len, "%s/%s", folder.c_str(), p->d_name));
-        assert(path_len == buf_len - 1);
-        filename.resize(path_len);
-
-        if (stat(filename.c_str(), &statbuf) == 0)
-            r = S_ISDIR(statbuf.st_mode)
-              ? remove_folder_and_subfolders(filename)
-              : unlink(filename.c_str()) == 0;
+        fprintf(stderr, "remove_folder_and_subfolders: %d %s\n",
+                ec.value(), ec.message().c_str());
     }
-    d.reset();
-
-    if (r)
-        r = rmdir(folder.c_str()) == 0;
-
-    return r;
-#    endif // !USE_SHELL_API
-#  endif  // !_WIN32
+    return !ec;
 }
 
 static
 bool
-make_directory(const std::string& folder)
+make_directory(const std::filesystem::path& folder)
 {
-#  ifdef _WIN32
-#    if USE_SHELL_API
-    // Re-create the folder.
-    std::string cmd = "mkdir \"";
-    cmd += folder;
-    cmd += '\"';
-    return std::system(cmd.c_str()) == EXIT_SUCCESS;
-#    else  // !USE_SHELL_API
-    return _mkdir(folder.c_str()) == 0;
-#    endif // !USE_SHELL_API
-#  else  // !_WIN32
-#    if USE_SHELL_API
-    return std::system(("mkdir -p " + folder).c_str()) == EXIT_SUCCESS;
-#    else  // !USE_SHELL_API
-    return mkdir(folder.c_str(), 0777) == 0;
-#    endif  // !USE_SHELL_API
-#  endif  // !_WIN32
+    std::error_code ec{};
+    std::filesystem::create_directories(folder, ec);
+    if (ec)
+    {
+        fprintf(stderr, "make_directory: %d %s\n",
+                ec.value(), ec.message().c_str());
+    }
+    return !ec;
 }
 
 static
 bool
-delete_file(const std::string& file)
+delete_file(const std::filesystem::path& file)
 {
-#  ifdef _WIN32
-#    if USE_SHELL_API
-    std::string cmd = "del \"";
-    cmd += file;
-    cmd += '\"';
-    return std::system(cmd.c_str()) == 0;
-#    else  // !USE_SHELL_API
-    return _unlink(file.c_str()) == 0;
-#    endif // !USE_SHELL_API
-#  else  // !_WIN32
-#    if USE_SHELL_API
-    return std::system(("rm " + file).c_str()) == EXIT_SUCCESS;
-#    else // !USE_SHELL_API
-    return unlink(file.c_str()) == 0;
-#    endif // !USE_SHELL_API
-#  endif  // !_WIN32
+    std::error_code ec{};
+    std::filesystem::remove(file, ec);
+    if (ec)
+    {
+        fprintf(stderr, "delete_file: %d %s\n",
+                ec.value(), ec.message().c_str());
+    }
+    return !ec;
 }
 
 #  ifdef _WIN32
 
 static
 bool
-move_file(const std::string& from, const std::string& to)
+move_file(const std::filesystem::path& from, const std::filesystem::path& to)
 {
-#    if USE_SHELL_API
-    std::string cmd = "move \"";
-    cmd += from;
-    cmd += "\" \"";
-    cmd += to;
-    cmd += '\"';
-    return std::system(cmd.c_str()) == EXIT_SUCCESS;
-#    else  // !USE_SHELL_API
-    return !!::MoveFile(from.c_str(), to.c_str());
-#    endif // !USE_SHELL_API
+    std::error_code ec{};
+    std::filesystem::rename(from, to, ec);
+
+    if (ec == std::errc::no_such_file_or_directory) {
+        if (file_exists(to))
+            return true;
+    }
+    
+    if (ec) fprintf(stderr, "move_file: %d %s\n", ec.value(), ec.message().c_str());
+    return !ec;
 }
 
 // Usually something like "c:\Program Files".
 static
-std::string
+std::filesystem::path
 get_program_folder()
 {
     return get_known_folder(FOLDERID_ProgramFiles);
@@ -3235,40 +3118,33 @@ get_program_folder()
 
 // Note folder can and usually does contain spaces.
 static
-std::string
+std::filesystem::path
 get_unzip_program()
 {
-    std::string path;
-
     // 7-Zip appears to note its location in the registry.
     // If that doesn't work, fall through and take a guess, but it will likely be wrong.
     HKEY hKey = nullptr;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\7-Zip", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\7-Zip", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
     {
-        char value_buffer[MAX_PATH + 1]; // fyi 260 at time of writing.
+        wchar_t value_buffer[MAX_PATH + 1]; // fyi 260 at time of writing.
         // in/out parameter. Documentation say that size is a count of bytes not chars.
         DWORD size = sizeof(value_buffer) - sizeof(value_buffer[0]);
         DWORD tzi_type = REG_SZ;
         // Testing shows Path key value is "C:\Program Files\7-Zip\" i.e. always with trailing \.
-        bool got_value = (RegQueryValueExA(hKey, "Path", nullptr, &tzi_type,
+        bool got_value = (RegQueryValueExW(hKey, L"Path", nullptr, &tzi_type,
             reinterpret_cast<LPBYTE>(value_buffer), &size) == ERROR_SUCCESS);
         RegCloseKey(hKey); // Close now incase of throw later.
         if (got_value)
         {
             // Function does not guarantee to null terminate.
             value_buffer[size / sizeof(value_buffer[0])] = '\0';
-            path = value_buffer;
-            if (!path.empty())
+            if (*value_buffer)
             {
-                path += "7z.exe";
-                return path;
+                return std::filesystem::path(value_buffer) / "7z.exe";
             }
         }
     }
-    path += get_program_folder();
-    path += folder_delimiter;
-    path += "7-Zip\\7z.exe";
-    return path;
+    return get_program_folder() / "7-Zip\\7z.exe";
 }
 
 #    if !USE_SHELL_API
@@ -3302,24 +3178,22 @@ run_program(const std::string& command)
 #    endif // !USE_SHELL_API
 
 static
-std::string
+std::filesystem::path
 get_download_tar_file(const std::string& version)
 {
     auto file = get_install();
-    file += folder_delimiter;
-    file += "tzdata";
-    file += version;
-    file += ".tar";
+    file /= "tzdata" + version + ".tar";
     return file;
 }
 
 static
 bool
-extract_gz_file(const std::string& version, const std::string& gz_file,
-                const std::string& dest_folder)
+extract_gz_file(const std::string& version, const std::filesystem::path& gz_file,
+                const std::filesystem::path& dest_folder)
 {
     auto unzip_prog = get_unzip_program();
     bool unzip_result = false;
+    unzip_prog.make_preferred();
     // Use the unzip program to extract the tar file from the archive.
 
     // Aim to create a string like:
@@ -3327,11 +3201,11 @@ extract_gz_file(const std::string& version, const std::string& gz_file,
     //     -o"C:\Users\SomeUser\Downloads\tzdata"
     std::string cmd;
     cmd = '\"';
-    cmd += unzip_prog;
+    cmd += unzip_prog.string();
     cmd += "\" x \"";
-    cmd += gz_file;
+    cmd += get_pref_path(gz_file);
     cmd += "\" -o\"";
-    cmd += dest_folder;
+    cmd += get_pref_path(dest_folder);
     cmd += '\"';
 
 #    if USE_SHELL_API
@@ -3353,11 +3227,11 @@ extract_gz_file(const std::string& version, const std::string& gz_file,
     // just extracted from the archive.
     auto tar_file = get_download_tar_file(version);
     cmd = '\"';
-    cmd += unzip_prog;
+    cmd += unzip_prog.string();
     cmd += "\" x \"";
-    cmd += tar_file;
+    cmd += get_pref_path(tar_file);
     cmd += "\" -o\"";
-    cmd += get_install();
+    cmd += get_pref_path(get_install());
     cmd += '\"';
 #    if USE_SHELL_API
     cmd = "\"" + cmd + "\"";
@@ -3375,11 +3249,12 @@ extract_gz_file(const std::string& version, const std::string& gz_file,
 }
 
 static
-std::string
+std::filesystem::path
 get_download_mapping_file(const std::string& version)
 {
-    auto file = get_install() + version + "windowsZones.xml";
-    return file;
+    auto path = get_install();
+    path.replace_filename(path.filename().string() + version + "windowsZones.xml");
+    return path;
 }
 
 #  else  // !_WIN32
@@ -3499,21 +3374,21 @@ remote_install(const std::string& version)
     auto success = false;
     assert(!version.empty());
 
-    std::string install = get_install();
+    auto install = get_install();
     auto gz_file = get_download_gz_file(version);
     if (file_exists(gz_file))
     {
-        if (file_exists(install))
+        if (file_exists(install)) {
             remove_folder_and_subfolders(install);
+        }
+
         if (make_directory(install))
         {
             if (tar_gz_unpack(version, gz_file, install))
                 success = true;
 #  ifdef _WIN32
             auto mapping_file_source = get_download_mapping_file(version);
-            auto mapping_file_dest = get_install();
-            mapping_file_dest += folder_delimiter;
-            mapping_file_dest += "windowsZones.xml";
+            auto mapping_file_dest = get_install() / "windowsZones.xml";
             if (!move_file(mapping_file_source, mapping_file_dest))
                 success = false;
 #  endif  // _WIN32
@@ -3526,11 +3401,11 @@ remote_install(const std::string& version)
 
 static
 std::string
-get_version(const std::string& path)
+get_version(const std::filesystem::path& path)
 {
     std::string version;
 
-    std::string path_version = path + "version";
+    auto path_version = path / "version";
 
     if (file_exists(path_version))
     {
@@ -3543,7 +3418,7 @@ get_version(const std::string& path)
             return version;
     }
 
-    std::string path_news = path + "NEWS";
+    auto path_news = path / "NEWS";
 
     if (file_exists(path_news))
     {
@@ -3561,7 +3436,8 @@ get_version(const std::string& path)
         }
     }
 
-    throw std::runtime_error("Unable to get Timezone database version from " + path);
+    throw std::runtime_error("Unable to get Timezone database version from " +
+                             get_pref_path(path));
 }
 
 static
@@ -3569,8 +3445,7 @@ std::unique_ptr<tzdb>
 init_tzdb()
 {
     using namespace date;
-    const std::string install = get_install();
-    const std::string path = install + folder_delimiter;
+    const auto install = get_install();
     std::string line;
     bool continue_zone = false;
     std::unique_ptr<tzdb> db(new tzdb);
@@ -3586,7 +3461,7 @@ init_tzdb()
                 std::string msg = "Timezone database version \"";
                 msg += rv;
                 msg += "\" did not install correctly to \"";
-                msg += install;
+                msg += get_pref_path(install);
                 msg += "\"";
                 throw std::runtime_error(msg);
             }
@@ -3594,22 +3469,22 @@ init_tzdb()
         if (!file_exists(install))
         {
             std::string msg = "Timezone database not found at \"";
-            msg += install;
+            msg += get_pref_path(install);
             msg += "\"";
             throw std::runtime_error(msg);
         }
-        db->version = get_version(path);
+        db->version = get_version(install);
     }
     else
     {
-        db->version = get_version(path);
+        db->version = get_version(install);
         auto rv = remote_version();
         if (!rv.empty() && db->version != rv)
         {
             if (remote_download(rv))
             {
                 remote_install(rv);
-                db->version = get_version(path);
+                db->version = get_version(install);
             }
         }
     }
@@ -3617,11 +3492,11 @@ init_tzdb()
     if (!file_exists(install))
     {
         std::string msg = "Timezone database not found at \"";
-        msg += install;
+        msg += get_pref_path(install);
         msg += "\"";
         throw std::runtime_error(msg);
     }
-    db->version = get_version(path);
+    db->version = get_version(install);
 #endif  // !AUTO_DOWNLOAD
 
     CONSTDATA char*const files[] =
@@ -3632,7 +3507,7 @@ init_tzdb()
 
     for (const auto& filename : files)
     {
-        std::string file_path = path + filename;
+        auto file_path = install / filename;
         if (!file_exists(file_path))
         {
           continue;
@@ -3692,7 +3567,7 @@ init_tzdb()
     db->leap_seconds.shrink_to_fit();
 
 #ifdef _WIN32
-    std::string mapping_file = get_install() + folder_delimiter + "windowsZones.xml";
+    auto mapping_file = get_install() / "windowsZones.xml";
     db->mappings = load_timezone_mappings_from_xml_file(mapping_file);
     sort_zone_mappings(db->mappings);
 #endif // _WIN32
